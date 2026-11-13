@@ -10,8 +10,9 @@ is used to demonstrate event-driven vulnerability remediation with Devin:
   4,200 open-source findings across its 336 projects.
 - **What this fork adds:** a GitHub Actions workflow,
   [`.github/workflows/snyk-fix-pr-to-devin.yml`](.github/workflows/snyk-fix-pr-to-devin.yml).
-  When Snyk opens a fix pull request, it runs Snyk on the affected manifests,
-  sends the reports to Devin Security as an ingestion scan, and has Devin
+  When Snyk opens a fix pull request, it scans the affected manifests with two
+  tools, Snyk and OSV-Scanner, sends both reports to Devin Security as one
+  ingestion scan (deduplicated across the tools), and has Devin
   remediate the findings for the packages Snyk's PR touches, with a Snyk
   re-scan and a build as evidence.
 - **Demo change:** `axios 0.21.1` was added to `packages/frontend` to

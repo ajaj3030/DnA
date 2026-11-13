@@ -1,7 +1,8 @@
 # Snyk opens a fix PR (Snyk app: "Fix this vulnerability", or its automatic
-# fix PRs) → Snyk's findings are ingested into Devin Security, which validates
-# and deduplicates them → Devin remediates the open high/critical findings for
-# the packages Snyk's PR touches, opening its fixes against Snyk's branch.
+# fix PRs) → Snyk and OSV-Scanner findings are ingested into Devin Security,
+# which deduplicates them across both tools and validates them → Devin
+# remediates the findings for the packages Snyk's PR touches, opening its
+# fixes against Snyk's branch.
 # Everything after the trigger is visible on the Devin Security screen.
 name: Snyk fix PR → Devin Security
 
@@ -44,7 +45,12 @@ jobs:
           node-version: "18"
       - name: Install Snyk CLI
         run: npm install --global snyk@1.1308.4
-      - name: Ingest Snyk findings into Devin Security and remediate
+      - name: Install OSV-Scanner
+        run: |
+          curl -sSfL -o osv-scanner https://github.com/google/osv-scanner/releases/download/v2.7.1/osv-scanner_linux_amd64
+          echo "fb7dab19a8bd9bbe5c3189f09d4b7ee1820c9553a23bac202648a56efd2f6ee8  osv-scanner" | sha256sum --check
+          sudo install osv-scanner /usr/local/bin/osv-scanner
+      - name: Ingest Snyk and OSV-Scanner findings into Devin Security and remediate
         run: python3 .github/scripts/snyk_fix_pr_to_devin.py
         env:
           GH_TOKEN: ${{ github.token }}

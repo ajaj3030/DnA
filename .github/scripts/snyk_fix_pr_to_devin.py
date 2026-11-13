@@ -2,10 +2,10 @@
 Snyk fix PR → Devin Security.
 
 When Snyk opens a fix pull request:
-1. run Snyk on the code the PR targets and upload its JSON and SARIF reports
-   to Devin,
+1. scan the code the PR targets with two tools, Snyk and OSV-Scanner, and
+   upload their reports to Devin,
 2. start a Devin Security ingestion scan with them, so the findings land on
-   the Security screen, triaged and deduplicated,
+   the Security screen, triaged and deduplicated across both tools,
 3. remediate the open findings (any severity) about the packages Snyk's PR
    changes, with Snyk's branch as the base: Devin's fixes finish Snyk's upgrade.
 
@@ -23,7 +23,7 @@ import uuid
 from pathlib import Path
 
 DEVIN_API = "https://api.devin.ai/v3/organizations"
-REPORTS = Path("snyk-reports")
+REPORTS = Path("scanner-reports")
 TERMINAL = {"completed", "failed", "cancelled"}
 POLL_SECONDS, POLL_LIMIT_SECONDS = 30, 45 * 60
 
@@ -58,10 +58,11 @@ def changed_packages(pr: dict) -> dict[str, list[str]]:
     return changes
 
 
-# ── Snyk ──────────────────────────────────────────────────────
+# ── Scanners: Snyk and OSV-Scanner ────────────────────────────
 
-def snyk_reports(rev: str, manifest: str) -> list[Path]:
-    """Snyk JSON and SARIF reports for a manifest as it was at a commit."""
+def scanner_reports(rev: str, manifest: str) -> list[Path]:
+    """Snyk (JSON, SARIF) and OSV-Scanner (JSON) reports for a manifest as it
+    was at a commit."""
     # Resolve the manifest on its own: the repo root declares npm workspaces,
     # which would otherwise move the lockfile to the root. The mirrored path
     # keeps report locations relative to the repo (packages/frontend/...).
@@ -84,13 +85,34 @@ def snyk_reports(rev: str, manifest: str) -> list[Path]:
         path = Path(f"{stem}{suffix}")
         path.write_text(scan.stdout)
         outputs.append(path)
+    outputs.append(osv_report(workdir / lockfile, Path(f"{stem}.osv.json")))
     return outputs
+
+
+def osv_report(lockfile: Path, out: Path) -> Path:
+    """OSV-Scanner findings for runtime dependencies only. Snyk skips
+    devDependencies by default, so both tools cover the same scope."""
+    scan = run(["osv-scanner", "scan", "source", "--lockfile", str(lockfile), "--format", "json"])
+    if scan.returncode not in (0, 1):  # 0 = clean, 1 = vulnerabilities found
+        raise RuntimeError(f"OSV-Scanner failed on {lockfile}: {scan.stderr[-500:]}")
+    report = json.loads(scan.stdout)
+    for result in report.get("results", []):
+        result["packages"] = [p for p in result.get("packages", []) if p.get("dependency_groups") != ["dev"]]
+    out.write_text(json.dumps(report, indent=1))
+    return out
 
 
 def snyk_counts(json_report: Path) -> str:
     issues = {v["id"]: v for v in json.loads(json_report.read_text()).get("vulnerabilities", [])}.values()
     counts = {s: sum(1 for i in issues if i["severity"] == s) for s in ("critical", "high", "medium", "low")}
     return ", ".join(f"{n} {s}" for s, n in counts.items() if n) or "no issues"
+
+
+def osv_counts(json_report: Path) -> str:
+    packages = [p for r in json.loads(json_report.read_text()).get("results", []) for p in r.get("packages", [])]
+    advisories = sum(len(p.get("vulnerabilities", [])) for p in packages)
+    names = ", ".join(sorted(f"{p['package']['name']}@{p['package']['version']}" for p in packages))
+    return f"{advisories} advisories in {len(packages)} packages ({names})" if packages else "no issues"
 
 
 # ── Devin Security (v3 API) ───────────────────────────────────
@@ -175,9 +197,11 @@ def main() -> None:
 
     reports = []
     for manifest in changes:
-        manifest_reports = snyk_reports(pr["baseRefOid"], manifest)
-        reports += manifest_reports
-        summary.append(f"- Snyk on `{manifest}` at {pr['baseRefOid'][:7]}: {snyk_counts(manifest_reports[0])}")
+        snyk_json, snyk_sarif, osv_json = scanner_reports(pr["baseRefOid"], manifest)
+        reports += [snyk_json, snyk_sarif, osv_json]
+        summary.append(f"- `{manifest}` at {pr['baseRefOid'][:7]}")
+        summary.append(f"  - Snyk: {snyk_counts(snyk_json)}")
+        summary.append(f"  - OSV-Scanner: {osv_counts(osv_json)}")
     if not reports or os.environ.get("DRY_RUN") == "true":
         write_summary(summary + ["", "Dry run or nothing to scan: nothing sent to Devin."])
         return
