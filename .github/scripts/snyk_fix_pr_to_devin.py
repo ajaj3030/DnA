@@ -108,6 +108,29 @@ def snyk_counts(json_report: Path) -> str:
     return ", ".join(f"{n} {s}" for s, n in counts.items() if n) or "no issues"
 
 
+INGESTION_NOTES = """# How to read these reports
+
+The reports attached to this scan come from two scanners run by CI on the
+same manifests:
+
+- Snyk Open Source: `*.snyk.json` and `*.snyk.sarif`
+- OSV-Scanner: `*.osv.json` (runtime dependencies only, like Snyk)
+
+The file name encodes the manifest, e.g. `packages_frontend_package.snyk.json`
+is `packages/frontend/package.json`.
+
+Deduplicate across both tools: the same package and version with the same CVE
+or GHSA ID is one finding, whichever tools and files report it. On each
+finding, say which tools reported it.
+"""
+
+
+def ingestion_notes() -> Path:
+    path = REPORTS / "README-ingestion.md"
+    path.write_text(INGESTION_NOTES)
+    return path
+
+
 def osv_counts(json_report: Path) -> str:
     packages = [p for r in json.loads(json_report.read_text()).get("results", []) for p in r.get("packages", [])]
     advisories = sum(len(p.get("vulnerabilities", [])) for p in packages)
@@ -206,7 +229,7 @@ def main() -> None:
         write_summary(summary + ["", "Dry run or nothing to scan: nothing sent to Devin."])
         return
 
-    scan_id = start_ingestion(repo, [upload(r) for r in reports])
+    scan_id = start_ingestion(repo, [upload(r) for r in [ingestion_notes(), *reports]])
     summary += ["", f"**Devin Security ingestion scan:** `{scan_id}`"]
     status = wait_for(scan_id, repo)
     summary.append(f"Scan status: {status}")
