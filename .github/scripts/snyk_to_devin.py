@@ -152,6 +152,7 @@ def main() -> None:
     if not commit_exists(base):
         write_summary([f"No earlier commit to compare with ({base[:12]}); skipping so the backlog isn't re-reported."])
         return
+    base = run(["git", "rev-parse", base]).stdout.strip()
 
     manifests = [m for m in os.environ.get("MANIFESTS", "").split(",") if m] or changed_manifests(base, head)
     findings = []
