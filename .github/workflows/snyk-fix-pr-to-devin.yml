@@ -1,0 +1,54 @@
+# Snyk opens a fix PR (from the Snyk app: "Fix this vulnerability", or its
+# automatic fix PRs) → Devin takes the PR over: verifies the upgrade, adapts
+# any code it breaks, re-scans with Snyk and builds as evidence, and pushes
+# to the same branch. A human reviews and merges.
+name: Snyk fix PR → Devin
+
+on:
+  pull_request:
+    types: [opened, reopened]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Number of the Snyk pull request to hand to Devin
+        required: true
+      dry_run:
+        description: Report what Devin would get without starting a session
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: snyk-fix-pr-to-devin-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: false
+
+jobs:
+  hand-to-devin:
+    # Only pull requests Snyk opened (title "[Snyk] ...", branch snyk-...)
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.event.pull_request.title, '[Snyk]') ||
+      startsWith(github.head_ref, 'snyk-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+      - name: Install Snyk CLI
+        run: npm install --global snyk@1.1308.4
+      - name: Re-scan the Snyk PR and hand it to Devin
+        run: python3 .github/scripts/snyk_fix_pr_to_devin.py
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
