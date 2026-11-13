@@ -36,7 +36,7 @@ TERMINAL = {"completed", "failed", "cancelled"}
 POLL_SECONDS, POLL_LIMIT_SECONDS = 30, 45 * 60
 # Fields written for humans. Dropping them keeps reports small enough to
 # upload; Devin can look any advisory up by its ID.
-VERBOSE_KEYS = {"details", "description", "references", "credits", "versions"}
+VERBOSE_KEYS = {"details", "description", "references", "credits", "versions", "help", "fullDescription"}
 
 
 def run(cmd: list[str], cwd: str | None = None) -> subprocess.CompletedProcess:
@@ -121,6 +121,7 @@ def npm_reports(rev: str, manifest: str) -> list[Path]:
     if scan.returncode not in (0, 1) or not snyk_json.exists():  # 0 = clean, 1 = issues found
         raise RuntimeError(f"Snyk failed on {manifest}: {scan.stdout[-500:]}{scan.stderr[-500:]}")
     compact(snyk_json)
+    compact(snyk_sarif)
     return [snyk_json, snyk_sarif, osv_report(workdir / lockfile, Path(f"{stem}.osv.json"))]
 
 
@@ -328,8 +329,10 @@ def ingest_backlog(repo: str) -> None:
         summary += scan_lines(manifest, found)
     total = sum(advisories(r) for r in reports if r.suffix == ".json")
     size_kb = sum(r.stat().st_size for r in reports) // 1024
+    largest = max(reports, key=lambda r: r.stat().st_size, default=None)
     summary += ["", f"**{total} advisories** across {len(npm) + len(python)} manifests and two scanners; "
-                    f"{len(reports)} reports, {size_kb} KB."]
+                    f"{len(reports)} reports, {size_kb} KB"
+                    + (f" (largest: {largest.name}, {largest.stat().st_size // 1024} KB)." if largest else ".")]
     if not reports or dry_run():
         write_summary(summary + ["", "Dry run or nothing to scan: nothing sent to Devin."])
         return
