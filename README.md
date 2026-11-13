@@ -1,3 +1,26 @@
+# Mercedes-Benz DnA: security remediation demo fork
+
+This is a fork of [mercedes-benz/DnA](https://github.com/mercedes-benz/DnA),
+Mercedes-Benz's open-source Data and Analytics platform (MIT). It is not a
+Mercedes-Benz deployment and is not affiliated with Mercedes-Benz. The fork
+is used to demonstrate event-driven vulnerability remediation with Devin:
+
+- **The codebase** is the upstream platform as published: Java/Spring Boot
+  services, a React/TypeScript frontend, Python tooling. Snyk reports about
+  4,200 open-source findings across its 336 projects.
+- **What this fork adds:** a GitHub Actions workflow,
+  [`.github/workflows/snyk-fix-pr-to-devin.yml`](.github/workflows/snyk-fix-pr-to-devin.yml).
+  When Snyk opens a fix pull request, it runs Snyk on the affected manifests,
+  sends the reports to Devin Security as an ingestion scan, and has Devin
+  remediate the findings for the packages Snyk's PR touches, with a Snyk
+  re-scan and a build as evidence.
+- **Demo change:** `axios 0.21.1` was added to `packages/frontend` to
+  simulate a developer adding a vulnerable dependency.
+
+The upstream README follows.
+
+---
+
 <!-- SPDX-License-Identifier: MIT -->
 
 <p align="center">
