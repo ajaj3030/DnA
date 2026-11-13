@@ -1,8 +1,9 @@
-# Snyk opens a fix PR (from the Snyk app: "Fix this vulnerability", or its
-# automatic fix PRs) → Devin takes the PR over: verifies the upgrade, adapts
-# any code it breaks, re-scans with Snyk and builds as evidence, and pushes
-# to the same branch. A human reviews and merges.
-name: Snyk fix PR → Devin
+# Snyk opens a fix PR (Snyk app: "Fix this vulnerability", or its automatic
+# fix PRs) → Snyk's findings are ingested into Devin Security, which validates
+# and deduplicates them → Devin remediates the open high/critical findings for
+# the packages Snyk's PR touches, opening its fixes against Snyk's branch.
+# Everything after the trigger is visible on the Devin Security screen.
+name: Snyk fix PR → Devin Security
 
 on:
   pull_request:
@@ -10,10 +11,10 @@ on:
   workflow_dispatch:
     inputs:
       pr:
-        description: Number of the Snyk pull request to hand to Devin
+        description: Number of the Snyk pull request
         required: true
       dry_run:
-        description: Report what Devin would get without starting a session
+        description: Run Snyk and report, without sending anything to Devin
         type: boolean
         default: true
 
@@ -26,14 +27,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  hand-to-devin:
+  devin-security:
     # Only pull requests Snyk opened (title "[Snyk] ...", branch snyk-...)
     if: >-
       github.event_name == 'workflow_dispatch' ||
       startsWith(github.event.pull_request.title, '[Snyk]') ||
       startsWith(github.head_ref, 'snyk-')
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,12 +44,14 @@ jobs:
           node-version: "18"
       - name: Install Snyk CLI
         run: npm install --global snyk@1.1308.4
-      - name: Re-scan the Snyk PR and hand it to Devin
+      - name: Ingest Snyk findings into Devin Security and remediate
         run: python3 .github/scripts/snyk_fix_pr_to_devin.py
         env:
           GH_TOKEN: ${{ github.token }}
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+          DEVIN_V3_API_KEY: ${{ secrets.DEVIN_V3_API_KEY }}
+          DEVIN_ORG_ID: ${{ vars.DEVIN_ORG_ID }}
+          DEVIN_INGEST_PROFILE_ID: ${{ vars.DEVIN_INGEST_PROFILE_ID }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
           DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}

@@ -1,132 +1,163 @@
 """
-Snyk fix PR → Devin: when Snyk opens a fix pull request, re-scan the
-dependency tree before and after it, then start one Devin session that takes
-the PR over: verify the upgrade, adapt code it breaks, prove the fix with a
-Snyk re-scan and a build, and push to the PR's branch.
+Snyk fix PR → Devin Security.
 
-A PR that already has a session (tagged snyk-pr:<repo>#<number>) is skipped.
+When Snyk opens a fix pull request:
+1. run Snyk on the code the PR targets and upload its JSON and SARIF reports
+   to Devin,
+2. start a Devin Security ingestion scan with them, so the findings land on
+   the Security screen, triaged and deduplicated,
+3. remediate the open high/critical findings about the packages Snyk's PR
+   changes, with Snyk's branch as the base: Devin's fixes finish Snyk's upgrade.
 
-Environment: GH_TOKEN, SNYK_TOKEN, DEVIN_API_KEY, REPO, PR_NUMBER, DRY_RUN,
-DEVIN_MAX_ACU.
+Environment: GH_TOKEN, SNYK_TOKEN, DEVIN_V3_API_KEY, DEVIN_ORG_ID,
+DEVIN_INGEST_PROFILE_ID, REPO, PR_NUMBER, DRY_RUN, MAX_REMEDIATIONS.
 """
 
 import json
 import os
 import subprocess
-import tempfile
+import time
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 
-DEVIN_API = "https://api.devin.ai/v1"
-SEVERITY_THRESHOLD = "high"
+DEVIN_API = "https://api.devin.ai/v3/organizations"
+REPORTS = Path("snyk-reports")
+TERMINAL = {"completed", "failed", "cancelled"}
+POLL_SECONDS, POLL_LIMIT_SECONDS = 30, 45 * 60
 
 
 def run(cmd: list[str], cwd: str | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
 
 
+# ── Pull request ──────────────────────────────────────────────
+
 def pull_request(repo: str, number: str) -> dict:
-    fields = "number,title,url,body,headRefName,baseRefOid,headRefOid,author"
+    fields = "number,title,url,headRefName,baseRefOid,headRefOid"
     result = run(["gh", "pr", "view", number, "--repo", repo, "--json", fields])
     if result.returncode != 0:
         raise RuntimeError(f"Could not read PR #{number}: {result.stderr}")
     return json.loads(result.stdout)
 
 
-def changed_manifests(base: str, head: str) -> list[str]:
-    diff = run(["git", "diff", "--name-only", base, head, "--", "**/package.json"])
-    return [path for path in diff.stdout.split() if path.endswith("package.json")]
+def manifest_at(rev: str, path: str) -> dict:
+    shown = run(["git", "show", f"{rev}:{path}"])
+    return json.loads(shown.stdout) if shown.returncode == 0 else {}
 
 
-def snyk_issues(rev: str, manifest: str) -> dict[str, dict]:
-    """High+ Snyk issues for a manifest at a commit, keyed by Snyk issue id."""
-    content = run(["git", "show", f"{rev}:{manifest}"])
-    if content.returncode != 0:
-        return {}  # manifest didn't exist at this commit
-    with tempfile.TemporaryDirectory() as work:
-        Path(work, "package.json").write_text(content.stdout)
-        lock = run(["npm", "install", "--package-lock-only", "--ignore-scripts",
-                    "--legacy-peer-deps", "--no-audit", "--no-fund"], cwd=work)
-        if lock.returncode != 0:
-            raise RuntimeError(f"npm could not resolve {manifest}@{rev[:7]}: {lock.stderr[-500:]}")
-        scan = run(["snyk", "test", "--file=package-lock.json",
-                    f"--severity-threshold={SEVERITY_THRESHOLD}", "--json"], cwd=work)
-    if scan.returncode not in (0, 1):  # 0 = clean, 1 = issues found
-        raise RuntimeError(f"Snyk failed on {manifest}@{rev[:7]}: {scan.stdout[-500:]}{scan.stderr[-500:]}")
-    return {v["id"]: v for v in json.loads(scan.stdout).get("vulnerabilities", [])}
+def changed_packages(pr: dict) -> dict[str, list[str]]:
+    """Per manifest, the dependencies whose version the PR changes."""
+    diff = run(["git", "diff", "--name-only", pr["baseRefOid"], pr["headRefOid"], "--", "**/package.json"])
+    changes = {}
+    for manifest in (p for p in diff.stdout.split() if p.endswith("package.json")):
+        before, after = manifest_at(pr["baseRefOid"], manifest), manifest_at(pr["headRefOid"], manifest)
+        deps = lambda m: {**m.get("dependencies", {}), **m.get("devDependencies", {})}
+        changes[manifest] = sorted(name for name, version in deps(after).items() if deps(before).get(name) != version)
+    return changes
 
 
-def describe_issue(issue: dict) -> str:
-    cves = ", ".join(issue.get("identifiers", {}).get("CVE", [])) or "no CVE"
-    return (f"- [{issue['severity'].upper()}] {issue['packageName']}@{issue['version']}: "
-            f"{issue['title']} ({cves}) https://security.snyk.io/vuln/{issue['id']}")
+# ── Snyk ──────────────────────────────────────────────────────
+
+def snyk_reports(rev: str, manifest: str) -> list[Path]:
+    """Snyk JSON and SARIF reports for a manifest as it was at a commit."""
+    workdir = Path(f"/tmp/snyk-{rev[:7]}")
+    if not workdir.exists():
+        run(["git", "worktree", "add", "--detach", str(workdir), rev])
+    package_dir = workdir / Path(manifest).parent
+    lock = run(["npm", "install", "--package-lock-only", "--ignore-scripts",
+                "--legacy-peer-deps", "--no-audit", "--no-fund"], cwd=str(package_dir))
+    if lock.returncode != 0:
+        raise RuntimeError(f"npm could not resolve {manifest}: {lock.stderr[-500:]}")
+    REPORTS.mkdir(exist_ok=True)
+    stem = REPORTS / manifest.replace("/", "_").removesuffix(".json")
+    lockfile = str(Path(manifest).parent / "package-lock.json")
+    outputs = []
+    for flag, suffix in (("--json", ".snyk.json"), ("--sarif", ".snyk.sarif")):
+        scan = run(["snyk", "test", f"--file={lockfile}", "--severity-threshold=low", flag], cwd=str(workdir))
+        if scan.returncode not in (0, 1):  # 0 = clean, 1 = issues found
+            raise RuntimeError(f"Snyk failed on {manifest}: {scan.stdout[-500:]}{scan.stderr[-500:]}")
+        path = Path(f"{stem}{suffix}")
+        path.write_text(scan.stdout)
+        outputs.append(path)
+    return outputs
 
 
-def rescan(pr: dict, manifests: list[str]) -> tuple[list[dict], list[dict]]:
-    """Issues the PR fixes, and high+ issues still present (or introduced) after it."""
-    fixed, remaining = [], []
-    for manifest in manifests:
-        before = snyk_issues(pr["baseRefOid"], manifest)
-        after = snyk_issues(pr["headRefOid"], manifest)
-        fixed += [issue for issue_id, issue in before.items() if issue_id not in after]
-        remaining += list(after.values())
-    return fixed, remaining
+def snyk_counts(json_report: Path) -> str:
+    issues = {v["id"]: v for v in json.loads(json_report.read_text()).get("vulnerabilities", [])}.values()
+    counts = {s: sum(1 for i in issues if i["severity"] == s) for s in ("critical", "high", "medium", "low")}
+    return ", ".join(f"{n} {s}" for s, n in counts.items() if n) or "no issues"
 
 
-def takeover_prompt(pr: dict, repo: str, manifests: list[str], fixed: list, remaining: list) -> str:
-    fixed_text = "\n".join(describe_issue(i) for i in fixed) or "- none detected by the re-scan"
-    remaining_text = "\n".join(describe_issue(i) for i in remaining) or "- none"
-    dirs = ", ".join(sorted({str(Path(m).parent) for m in manifests}))
-    return f"""Snyk opened a security fix pull request on {repo}: {pr['url']}
-"{pr['title']}" (branch {pr['headRefName']})
+# ── Devin Security (v3 API) ───────────────────────────────────
 
-Our Snyk re-scan of the PR:
-Fixed by this PR:
-{fixed_text}
-High or critical issues still present after it:
-{remaining_text}
-
-Take this PR over and make it safe to merge. Work on the existing branch {pr['headRefName']}; don't open a new PR. Never open pull requests or issues on mercedes-benz/DnA.
-1. Check Snyk's version change. If it is a major-version upgrade, read the package's changelog for breaking changes, find every place the code uses the package, and update that code.
-2. If high or critical issues remain in packages this PR touches, upgrade further to resolve them.
-3. Prove the fix is safe. In {dirs}: `npm install --package-lock-only --ignore-scripts --legacy-peer-deps`, then `snyk test --file=package-lock.json --severity-threshold=high` (SNYK_TOKEN is provided) and confirm the issues above are gone with nothing new; then `npm install --legacy-peer-deps`, `npm run build`, and the tests if they exist.
-4. Push your commits to {pr['headRefName']} and comment on the PR with: what Snyk changed, what you changed and why, the evidence from step 3 (Snyk before/after, build and test results), and the code paths you checked. Do not merge.
-"""
-
-
-def devin_request(method: str, path: str, body: dict | None = None) -> dict:
+def devin(method: str, path: str, body: dict | None = None, raw: bytes | None = None,
+          content_type: str = "application/json") -> dict:
+    data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
     request = urllib.request.Request(
-        f"{DEVIN_API}{path}", method=method,
-        data=json.dumps(body).encode() if body else None,
-        headers={"Authorization": f"Bearer {os.environ['DEVIN_API_KEY']}",
-                 "Content-Type": "application/json"},
+        f"{DEVIN_API}/{os.environ['DEVIN_ORG_ID']}{path}", method=method, data=data,
+        headers={"Authorization": f"Bearer {os.environ['DEVIN_V3_API_KEY']}", "Content-Type": content_type},
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.load(response)
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"Devin API {method} {path} → {error.code}: {error.read().decode()[:500]}") from error
 
 
-def existing_session(tag: str) -> str | None:
-    sessions = devin_request("GET", f"/sessions?limit=1&tags={urllib.parse.quote(tag)}").get("sessions", [])
-    return sessions[0]["session_id"] if sessions else None
+def upload(report: Path) -> str:
+    boundary = uuid.uuid4().hex
+    body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{report.name}\"\r\n"
+            f"Content-Type: application/octet-stream\r\n\r\n").encode() + report.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
+    return devin("POST", "/attachments", raw=body, content_type=f"multipart/form-data; boundary={boundary}")["url"]
 
 
-def start_session(pr: dict, prompt: str, tag: str) -> str:
-    return devin_request("POST", "/sessions", {
-        "title": f"Snyk PR #{pr['number']}: {pr['title'].removeprefix('[Snyk] ')}",
-        "prompt": prompt,
-        "tags": ["snyk-fix-pr", tag],
-        "idempotent": True,
-        "max_acu_limit": int(os.environ.get("DEVIN_MAX_ACU", "10")),
-        "session_secrets": [{"key": "SNYK_TOKEN", "value": os.environ["SNYK_TOKEN"]}],
-    })["url"]
+def start_ingestion(repo: str, attachment_urls: list[str]) -> str:
+    scan = devin("POST", "/code-scans/ingestion", {
+        "profile_id": os.environ["DEVIN_INGEST_PROFILE_ID"],
+        "repo_name": repo,
+        "attachment_urls": attachment_urls,
+    })
+    return scan["scan_id"]
 
+
+def wait_for(scan_id: str, repo: str) -> str:
+    waited = 0
+    while waited < POLL_LIMIT_SECONDS:
+        scans = devin("GET", f"/code-scans/scans?first=50&repo_name={urllib.parse.quote(repo)}").get("items", [])
+        status = next((s["status"] for s in scans if s["scan_id"] == scan_id), "unknown")
+        print(f"  scan {scan_id}: {status}", flush=True)
+        if status in TERMINAL:
+            return status
+        time.sleep(POLL_SECONDS)
+        waited += POLL_SECONDS
+    return "timed out"
+
+
+def open_findings(scan_id: str) -> list[dict]:
+    findings = []
+    for severity in ("critical", "high"):
+        query = urllib.parse.urlencode({"scan_id": scan_id, "severity": severity, "status": "open", "first": 100})
+        findings += devin("GET", f"/code-scans/findings?{query}").get("items", [])
+    return findings
+
+
+def about(finding: dict, packages: set[str]) -> bool:
+    text = f"{finding.get('title', '')} {finding.get('description', '')}".lower()
+    return any(package.lower() in text for package in packages)
+
+
+def remediate(finding: dict, branch: str) -> str:
+    return devin("POST", f"/code-scans/findings/{finding['finding_id']}/remediate", {"branch": branch})["session_id"]
+
+
+# ── Main ──────────────────────────────────────────────────────
 
 def write_summary(lines: list[str]) -> None:
     text = "\n".join(lines)
     print(text)
-    summary = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary:
+    if (summary := os.environ.get("GITHUB_STEP_SUMMARY")):
         with open(summary, "a") as f:
             f.write(text + "\n")
 
@@ -134,24 +165,38 @@ def write_summary(lines: list[str]) -> None:
 def main() -> None:
     repo, number = os.environ["REPO"], os.environ["PR_NUMBER"]
     pr = pull_request(repo, number)
-    manifests = changed_manifests(pr["baseRefOid"], pr["headRefOid"])
-    fixed, remaining = rescan(pr, manifests)
-    tag = f"snyk-pr:{repo}#{number}"
+    changes = changed_packages(pr)
+    packages = {name for names in changes.values() for name in names}
+    summary = [f"## Snyk fix PR → Devin Security: [#{number}]({pr['url']}) {pr['title']}",
+               f"Packages Snyk's PR changes: {', '.join(sorted(packages)) or 'none'}", ""]
 
-    if os.environ.get("DRY_RUN") == "true":
-        outcome = "dry run, no session started"
-    elif (session_id := existing_session(tag)):
-        outcome = f"already in progress: https://app.devin.ai/sessions/{session_id.removeprefix('devin-')}"
-    else:
-        outcome = start_session(pr, takeover_prompt(pr, repo, manifests, fixed, remaining), tag)
+    reports = []
+    for manifest in changes:
+        manifest_reports = snyk_reports(pr["baseRefOid"], manifest)
+        reports += manifest_reports
+        summary.append(f"- Snyk on `{manifest}` at {pr['baseRefOid'][:7]}: {snyk_counts(manifest_reports[0])}")
+    if not reports or os.environ.get("DRY_RUN") == "true":
+        write_summary(summary + ["", "Dry run or nothing to scan: nothing sent to Devin."])
+        return
 
-    write_summary([
-        f"## Snyk fix PR → Devin: [#{number}]({pr['url']}) {pr['title']}",
-        f"Manifests: {', '.join(manifests) or 'none'}",
-        "", "**Fixed by the PR**", *(describe_issue(i) for i in fixed or []), "" if fixed else "- none",
-        "", "**Still high or critical after it**", *(describe_issue(i) for i in remaining), "" if remaining else "- none",
-        "", f"**Devin:** {outcome}",
-    ])
+    scan_id = start_ingestion(repo, [upload(r) for r in reports])
+    summary += ["", f"**Devin Security ingestion scan:** `{scan_id}`"]
+    status = wait_for(scan_id, repo)
+    summary.append(f"Scan status: {status}")
+    if status != "completed":
+        write_summary(summary)
+        raise SystemExit(1)
+
+    findings = open_findings(scan_id)
+    targeted = [f for f in findings if about(f, packages)] or findings
+    cap = int(os.environ.get("MAX_REMEDIATIONS", "3"))
+    summary += ["", f"{len(findings)} open high/critical findings; remediating {min(len(targeted), cap)} "
+                    f"against `{pr['headRefName']}`.", "",
+                "| Severity | Finding | Devin session |", "|---|---|---|"]
+    for finding in targeted[:cap]:
+        session = remediate(finding, pr["headRefName"])
+        summary.append(f"| {finding['severity']} | {finding['title']} | https://app.devin.ai/sessions/{session.removeprefix('devin-')} |")
+    write_summary(summary)
 
 
 if __name__ == "__main__":
