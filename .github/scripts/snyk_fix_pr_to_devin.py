@@ -62,10 +62,13 @@ def changed_packages(pr: dict) -> dict[str, list[str]]:
 
 def snyk_reports(rev: str, manifest: str) -> list[Path]:
     """Snyk JSON and SARIF reports for a manifest as it was at a commit."""
+    # Resolve the manifest on its own: the repo root declares npm workspaces,
+    # which would otherwise move the lockfile to the root. The mirrored path
+    # keeps report locations relative to the repo (packages/frontend/...).
     workdir = Path(f"/tmp/snyk-{rev[:7]}")
-    if not workdir.exists():
-        run(["git", "worktree", "add", "--detach", str(workdir), rev])
     package_dir = workdir / Path(manifest).parent
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "package.json").write_text(run(["git", "show", f"{rev}:{manifest}"]).stdout)
     lock = run(["npm", "install", "--package-lock-only", "--ignore-scripts",
                 "--legacy-peer-deps", "--no-audit", "--no-fund"], cwd=str(package_dir))
     if lock.returncode != 0:
