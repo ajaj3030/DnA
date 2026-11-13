@@ -6,7 +6,7 @@ When Snyk opens a fix pull request:
    to Devin,
 2. start a Devin Security ingestion scan with them, so the findings land on
    the Security screen, triaged and deduplicated,
-3. remediate the open high/critical findings about the packages Snyk's PR
+3. remediate the open findings (any severity) about the packages Snyk's PR
    changes, with Snyk's branch as the base: Devin's fixes finish Snyk's upgrade.
 
 Environment: GH_TOKEN, SNYK_TOKEN, DEVIN_V3_API_KEY, DEVIN_ORG_ID,
@@ -139,11 +139,11 @@ def wait_for(scan_id: str, repo: str) -> str:
 
 
 def open_findings(scan_id: str) -> list[dict]:
-    findings = []
-    for severity in ("critical", "high"):
-        query = urllib.parse.urlencode({"scan_id": scan_id, "severity": severity, "status": "open", "first": 100})
-        findings += devin("GET", f"/code-scans/findings?{query}").get("items", [])
-    return findings
+    """Every open finding, at any severity: triage may lower Snyk's severity
+    (e.g. when the vulnerable code isn't reachable), and the package Snyk's
+    PR targets should still be finished."""
+    query = urllib.parse.urlencode({"scan_id": scan_id, "status": "open", "first": 100})
+    return devin("GET", f"/code-scans/findings?{query}").get("items", [])
 
 
 def about(finding: dict, packages: set[str]) -> bool:
@@ -191,10 +191,12 @@ def main() -> None:
         raise SystemExit(1)
 
     findings = open_findings(scan_id)
-    targeted = [f for f in findings if about(f, packages)] or findings
+    # Only the packages Snyk's PR changes: other findings stay in Devin
+    # Security for triage and bulk assignment, not on Snyk's branch.
+    targeted = [f for f in findings if about(f, packages)]
     cap = int(os.environ.get("MAX_REMEDIATIONS", "3"))
-    summary += ["", f"{len(findings)} open high/critical findings; remediating {min(len(targeted), cap)} "
-                    f"against `{pr['headRefName']}`.", "",
+    summary += ["", f"{len(findings)} open findings; {len(targeted)} about {', '.join(sorted(packages))}; "
+                    f"remediating {min(len(targeted), cap)} against `{pr['headRefName']}`.", "",
                 "| Severity | Finding | Devin session |", "|---|---|---|"]
     for finding in targeted[:cap]:
         session = remediate(finding, pr["headRefName"])
