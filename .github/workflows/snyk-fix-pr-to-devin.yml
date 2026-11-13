@@ -4,6 +4,8 @@
 # remediates the findings for the packages Snyk's PR touches, opening its
 # fixes against Snyk's branch.
 # Everything after the trigger is visible on the Devin Security screen.
+# Run manually with "backlog" to ingest the repo's existing dependency
+# backlog (every npm and Python manifest) as one Devin Security scan.
 name: Snyk fix PR → Devin Security
 
 on:
@@ -12,8 +14,12 @@ on:
   workflow_dispatch:
     inputs:
       pr:
-        description: Number of the Snyk pull request
-        required: true
+        description: Number of the Snyk pull request (leave empty for a backlog run)
+        required: false
+      backlog:
+        description: Ingest the whole repo's dependency backlog instead of one Snyk PR
+        type: boolean
+        default: false
       dry_run:
         description: Run Snyk and report, without sending anything to Devin
         type: boolean
@@ -24,7 +30,7 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: snyk-fix-pr-to-devin-${{ github.event.pull_request.number || inputs.pr }}
+  group: snyk-fix-pr-to-devin-${{ github.event.pull_request.number || inputs.pr || 'backlog' }}
   cancel-in-progress: false
 
 jobs:
@@ -60,4 +66,5 @@ jobs:
           DEVIN_INGEST_PROFILE_ID: ${{ vars.DEVIN_INGEST_PROFILE_ID }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
+          BACKLOG: ${{ inputs.backlog && 'true' || 'false' }}
           DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
