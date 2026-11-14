@@ -290,7 +290,8 @@ def about(finding: dict, packages: set[str]) -> bool:
 
 
 def remediate(finding: dict, branch: str) -> str:
-    return devin("POST", f"/code-scans/findings/{finding['finding_id']}/remediate", {"branch": branch})["session_id"]
+    path = f"/code-scans/{finding['scan_id']}/findings/{finding['finding_id']}/remediate"
+    return devin("POST", path, {"branch": branch})["session_id"]
 
 
 # ── Modes ─────────────────────────────────────────────────────
