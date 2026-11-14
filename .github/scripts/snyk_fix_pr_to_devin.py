@@ -37,6 +37,7 @@ POLL_SECONDS, POLL_LIMIT_SECONDS = 30, 45 * 60
 # Fields written for humans. Dropping them keeps reports small enough to
 # upload; Devin can look any advisory up by its ID.
 VERBOSE_KEYS = {"details", "description", "references", "credits", "versions", "help", "fullDescription"}
+MAX_ATTACHMENTS = 10  # per ingestion scan, enforced by the Devin API
 
 
 def run(cmd: list[str], cwd: str | None = None) -> subprocess.CompletedProcess:
@@ -188,6 +189,12 @@ is `packages/frontend/package.json`. Long descriptions, references and
 affected-version lists were removed to keep the reports small; look advisories
 up by their ID.
 
+When a scan covers many manifests, each tool's reports are merged into one
+file in that tool's multi-project format: `all.snyk.json` is a JSON array with
+one Snyk result per manifest (see `displayTargetFile`), `all.snyk.sarif` has
+one run per manifest, and `all.osv.json` has one result per manifest (see
+`source.path`, which ends in the repo-relative path).
+
 Deduplicate across tools and manifests: the same package and version with the
 same CVE or GHSA ID is one finding, whichever tools and files report it. On
 each finding, say which tools reported it and list every manifest it appears
@@ -199,6 +206,26 @@ def ingestion_notes() -> Path:
     path = REPORTS / "README-ingestion.md"
     path.write_text(INGESTION_NOTES)
     return path
+
+
+def merged_by_tool(reports: list[Path]) -> list[Path]:
+    """One file per tool and format, in each tool's own multi-project shape:
+    a JSON array of Snyk results (as `snyk test --all-projects --json` writes),
+    one SARIF log with a run per manifest, and one OSV report."""
+    def load_all(suffix: str) -> list:
+        return [json.loads(r.read_text()) for r in reports if r.name.endswith(suffix)]
+    snyk, sarif, osv = load_all(".snyk.json"), load_all(".snyk.sarif"), load_all(".osv.json")
+    merged = {
+        "all.snyk.json": snyk,
+        "all.snyk.sarif": {**sarif[0], "runs": [run for log in sarif for run in log["runs"]]} if sarif else None,
+        "all.osv.json": {"results": [result for report in osv for result in report.get("results", [])]},
+    }
+    paths = []
+    for name, content in merged.items():
+        if content:
+            (path := REPORTS / name).write_text(json.dumps(content))
+            paths.append(path)
+    return paths
 
 
 # ── Devin Security (v3 API) ───────────────────────────────────
@@ -225,6 +252,9 @@ def upload(report: Path) -> str:
 
 
 def start_ingestion(repo: str, reports: list[Path]) -> str:
+    # The notes file takes one of the scan's attachment slots
+    if len(reports) + 1 > MAX_ATTACHMENTS:
+        reports = merged_by_tool(reports)
     scan = devin("POST", "/code-scans/ingestion", {
         "profile_id": os.environ["DEVIN_INGEST_PROFILE_ID"],
         "repo_name": repo,
