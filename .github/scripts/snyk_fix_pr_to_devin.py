@@ -284,9 +284,17 @@ def open_findings(scan_id: str) -> list[dict]:
     return devin("GET", f"/code-scans/findings?{query}").get("items", [])
 
 
-def about(finding: dict, packages: set[str]) -> bool:
-    text = f"{finding.get('title', '')} {finding.get('description', '')}".lower()
-    return any(package.lower() in text for package in packages)
+def one_per_package(findings: list[dict], packages: set[str]) -> list[dict]:
+    """The first open finding about each package Snyk's PR changes. Upgrading
+    a package fixes all of its advisories, so one session per package is
+    enough; one per advisory would open duplicate PRs."""
+    chosen: dict[str, dict] = {}
+    for finding in findings:
+        text = f"{finding.get('title', '')} {finding.get('description', '')}".lower()
+        for package in sorted(packages):
+            if package.lower() in text and package not in chosen:
+                chosen[package] = finding
+    return list(chosen.values())
 
 
 def remediate(finding: dict, branch: str) -> str:
@@ -334,9 +342,9 @@ def ingest_and_fix_snyk_pr(repo: str, number: str) -> None:
     findings = open_findings(scan_id)
     # Only the packages Snyk's PR changes: other findings stay in Devin
     # Security for triage and bulk assignment, not on Snyk's branch.
-    targeted = [f for f in findings if about(f, packages)]
+    targeted = one_per_package(findings, packages)
     cap = int(os.environ.get("MAX_REMEDIATIONS", "3"))
-    summary += ["", f"{len(findings)} open findings; {len(targeted)} about {', '.join(sorted(packages))}; "
+    summary += ["", f"{len(findings)} open findings; one per package for {', '.join(sorted(packages))}; "
                     f"remediating {min(len(targeted), cap)} against `{pr['headRefName']}`.", "",
                 "| Severity | Finding | Devin session |", "|---|---|---|"]
     for finding in targeted[:cap]:
